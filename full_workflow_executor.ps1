@@ -9,6 +9,28 @@ else {
 Write-Host 'Prerequisites: system Python 3.12 or 3.13 and PowerShell. First run installs dependencies into .python-packages; no virtual environment or global Python install is used.'
 $savedErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
+
+# Keep credentials and launcher-installed dependencies out of Git after a fresh clone.
+$gitignorePath = Join-Path $PSScriptRoot '.gitignore'
+$requiredIgnoreRules = @('.env', '.env.*', '.venv/', 'venv/', '.python-packages/', '__pycache__/', '*.py[cod]')
+if (Test-Path -LiteralPath $gitignorePath) {
+    $gitignoreItem = Get-Item -LiteralPath $gitignorePath -Force
+    if (-not $gitignoreItem.PSIsContainer -and ($gitignoreItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw '.gitignore is a link; refusing to write through it.'
+    }
+    if ($gitignoreItem.PSIsContainer) { throw '.gitignore exists as a directory; refusing to replace it.' }
+    $existingIgnoreRules = @(Get-Content -LiteralPath $gitignorePath)
+    $missingIgnoreRules = @($requiredIgnoreRules | Where-Object { $existingIgnoreRules -notcontains $_ })
+    if ($missingIgnoreRules.Count -gt 0) {
+        Add-Content -LiteralPath $gitignorePath -Value ("`n# Local secrets and launcher dependencies" + [Environment]::NewLine + ($missingIgnoreRules -join [Environment]::NewLine))
+        Write-Host 'Added missing local-secret and launcher-dependency rules to .gitignore.'
+    }
+}
+else {
+    Set-Content -LiteralPath $gitignorePath -Value ($requiredIgnoreRules -join [Environment]::NewLine) -Encoding UTF8
+    Write-Host 'Created a default .gitignore for .env, virtualenvs, and local launcher dependencies.'
+}
+
 $pythonCommand = $null
 $pythonPrefix = @()
 $pythonVersion = $null
@@ -620,7 +642,7 @@ try {
         $credentialMode = $null
         $dotEnvValues = @{}
         if ($mode -in @('1', '2', '3')) {
-            $credentialMode = Read-Choice 'Credentials: 1=load from .env, 2=enter hidden prompts' '1' @('1', '2')
+            $credentialMode = Read-Choice 'Credentials: 1=load from .env, 2=enter hidden prompts' '2' @('1', '2')
             if ($credentialMode -eq '1') {
                 $dotEnvValues = Read-DotEnv
                 Write-Host '.env loaded without displaying values. Use PATIENT_API_KEY, DOCTOR_API_KEY, EVALUATOR_API_KEY, or DEEPSEEK_API_KEY for DeepSeek.'
@@ -644,8 +666,7 @@ try {
                 $env:CP_DOCTOR_KEY = Resolve-DotEnvKey $dotEnvValues 'doctor' $doctorModel $doctorUrl
             }
             else {
-                $keyDefault = if ($doctorUrl.TrimEnd('/') -ieq $patientUrl.TrimEnd('/')) { '2' } else { '1' }
-                $env:CP_DOCTOR_KEY = Read-SelectedKey 'Doctor' $keyDefault $true $false
+                $env:CP_DOCTOR_KEY = Read-SelectedKey 'Doctor' '1' $true $false
             }
             $responses = (Read-Choice 'Doctor Responses API? y/n' 'n' @('y', 'n')) -eq 'y'
             $workers = Read-Positive 'Inference parallel workers' 1
@@ -659,7 +680,7 @@ try {
             if (Test-Path -LiteralPath $inputPath) {
                 if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) { throw 'Inference output path is not a file.' }
                 if ((Get-Item -LiteralPath $inputPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Inference output path is a link; refusing to write through it.' }
-                $choice = Read-Choice 'Existing inference: 1=resume, 2=backup and restart, 0=cancel' '0' @('0', '1', '2')
+                $choice = Read-Choice 'Existing inference: 1=resume, 2=backup and restart, 0=cancel' '2' @('0', '1', '2')
                 if ($choice -eq '0') { throw 'Cancelled; existing artifacts were not changed.' }
                 if ($choice -eq '1') {
                     Write-Host 'Warning: the existing first-case result may be reused, not newly inferred. Endpoints, limits and Responses API settings cannot be verified and may not be applied.'
@@ -710,8 +731,7 @@ try {
             $env:CP_EVALUATOR_KEY = Resolve-DotEnvKey $dotEnvValues 'evaluator' $evalModel $evalUrl
         }
         elseif ($mode -eq '1') {
-            $keyDefault = if ($evalUrl.TrimEnd('/') -ieq $doctorUrl.TrimEnd('/')) { '3' } elseif ($evalUrl.TrimEnd('/') -ieq $patientUrl.TrimEnd('/')) { '2' } else { '1' }
-            $env:CP_EVALUATOR_KEY = Read-SelectedKey 'Evaluator' $keyDefault $true $true
+            $env:CP_EVALUATOR_KEY = Read-SelectedKey 'Evaluator' '1' $true $true
         } else { $env:CP_EVALUATOR_KEY = Read-Key 'Enter evaluator API key (hidden)' }
         $evalWorkers = Read-Positive 'Evaluation max workers' 4
         $outputPath = Resolve-EvaluationOutput $outputPath
