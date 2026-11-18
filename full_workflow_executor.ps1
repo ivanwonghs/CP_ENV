@@ -121,6 +121,47 @@ function Read-Key([string]$Label) {
     try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr); $secure.Dispose() }
 }
+function Read-DotEnv {
+    $path = Join-Path $PSScriptRoot '.env'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw '.env was selected but no .env file exists in the repository folder.'
+    }
+    $values = @{}
+    foreach ($line in Get-Content -LiteralPath $path) {
+        $text = ([string]$line).Trim()
+        if (-not $text -or $text.StartsWith('#')) { continue }
+        $text = $text -replace '^export\s+', ''
+        if ($text -notmatch '^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') { continue }
+        $name = $Matches[1]
+        $value = $Matches[2].Trim()
+        if ($value.Length -ge 2 -and
+            (($value.StartsWith('"') -and $value.EndsWith('"')) -or
+             ($value.StartsWith("'") -and $value.EndsWith("'")))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        $values[$name] = $value
+    }
+    return $values
+}
+function Resolve-DotEnvKey([hashtable]$Values, [string]$Role, [string]$Model, [string]$BaseUrl) {
+    $roleName = $Role.ToUpperInvariant()
+    foreach ($name in @("${roleName}_API_KEY", "CP_${roleName}_KEY")) {
+        if ($Values.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace([string]$Values[$name])) {
+            return [string]$Values[$name]
+        }
+    }
+    $uri = $null
+    $isDeepSeek = ($Model -eq 'deepseek-flash') -or
+        ([Uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -and $uri.Host -eq 'api.deepseek.com')
+    if ($isDeepSeek -and $Values.ContainsKey('DEEPSEEK_API_KEY') -and
+        -not [string]::IsNullOrWhiteSpace([string]$Values['DEEPSEEK_API_KEY'])) {
+        return [string]$Values['DEEPSEEK_API_KEY']
+    }
+    if ([Uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -and $uri.IsLoopback) {
+        return 'EMPTY'
+    }
+    throw "No .env key configured for $Role at the selected provider. Set ${roleName}_API_KEY; for DeepSeek you may use DEEPSEEK_API_KEY."
+}
 function Read-SelectedKey([string]$Role, [string]$Default, [bool]$HasPatient, [bool]$HasDoctor) {
     $choices = @('1')
     $label = "$Role key: 1=new key"
@@ -576,16 +617,36 @@ try {
             Write-Host 'Operational defaults: one inference worker to reduce API contention; original pathway limits are 8 encounters, 5 talk turns, 3 queries.'
             Write-Host 'The original inference code selects only the first test-split case; model names determine its output filename.'
         }
+        $credentialMode = $null
+        $dotEnvValues = @{}
+        if ($mode -in @('1', '2', '3')) {
+            $credentialMode = Read-Choice 'Credentials: 1=load from .env, 2=enter hidden prompts' '1' @('1', '2')
+            if ($credentialMode -eq '1') {
+                $dotEnvValues = Read-DotEnv
+                Write-Host '.env loaded without displaying values. Use PATIENT_API_KEY, DOCTOR_API_KEY, EVALUATOR_API_KEY, or DEEPSEEK_API_KEY for DeepSeek.'
+            }
+            else { Write-Host 'API keys are requested with hidden input and are not written to .env.' }
+        }
         $inputPath = $null
         if ($mode -in @('1', '2')) {
             $patientModel = Read-Model 'Patient model' $patientModelDefault
             $patientUrl = Read-BaseUrl 'Patient base URL' $patientUrlDefault
-            $patientKeyPrompt = if ($profile -eq '2') { 'Enter patient API key (hidden; local vLLM can use EMPTY)' } else { 'Enter patient API key (hidden)' }
-            $env:CP_PATIENT_KEY = Read-Key $patientKeyPrompt
+            if ($credentialMode -eq '1') {
+                $env:CP_PATIENT_KEY = Resolve-DotEnvKey $dotEnvValues 'patient' $patientModel $patientUrl
+            }
+            else {
+                $patientKeyPrompt = if ($profile -eq '2') { 'Enter patient API key (hidden; local vLLM can use EMPTY)' } else { 'Enter patient API key (hidden)' }
+                $env:CP_PATIENT_KEY = Read-Key $patientKeyPrompt
+            }
             $doctorModel = Read-Model 'Doctor model' $doctorModelDefault
             $doctorUrl = Read-BaseUrl 'Doctor base URL' $doctorUrlDefault
-            $keyDefault = if ($doctorUrl.TrimEnd('/') -ieq $patientUrl.TrimEnd('/')) { '2' } else { '1' }
-            $env:CP_DOCTOR_KEY = Read-SelectedKey 'Doctor' $keyDefault $true $false
+            if ($credentialMode -eq '1') {
+                $env:CP_DOCTOR_KEY = Resolve-DotEnvKey $dotEnvValues 'doctor' $doctorModel $doctorUrl
+            }
+            else {
+                $keyDefault = if ($doctorUrl.TrimEnd('/') -ieq $patientUrl.TrimEnd('/')) { '2' } else { '1' }
+                $env:CP_DOCTOR_KEY = Read-SelectedKey 'Doctor' $keyDefault $true $false
+            }
             $responses = (Read-Choice 'Doctor Responses API? y/n' 'n' @('y', 'n')) -eq 'y'
             $workers = Read-Positive 'Inference parallel workers' 1
             $dataRepo = Read-Default 'Dataset repository or path' 'SII-SPIRAL-MED/DiagnosisArena'
@@ -645,7 +706,10 @@ try {
         $urlDefault = if ($mode -eq '1') { $evaluatorUrlDefault } else { 'https://api.deepseek.com' }
         $evalModel = Read-EvaluatorModel 'Evaluator model (ID, not output path)' $modelDefault
         $evalUrl = Read-BaseUrl 'Evaluator base URL' $urlDefault
-        if ($mode -eq '1') {
+        if ($credentialMode -eq '1') {
+            $env:CP_EVALUATOR_KEY = Resolve-DotEnvKey $dotEnvValues 'evaluator' $evalModel $evalUrl
+        }
+        elseif ($mode -eq '1') {
             $keyDefault = if ($evalUrl.TrimEnd('/') -ieq $doctorUrl.TrimEnd('/')) { '3' } elseif ($evalUrl.TrimEnd('/') -ieq $patientUrl.TrimEnd('/')) { '2' } else { '1' }
             $env:CP_EVALUATOR_KEY = Read-SelectedKey 'Evaluator' $keyDefault $true $true
         } else { $env:CP_EVALUATOR_KEY = Read-Key 'Enter evaluator API key (hidden)' }
