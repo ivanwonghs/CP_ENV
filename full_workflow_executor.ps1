@@ -666,7 +666,7 @@ try {
                 $env:CP_DOCTOR_KEY = Resolve-DotEnvKey $dotEnvValues 'doctor' $doctorModel $doctorUrl
             }
             else {
-                $env:CP_DOCTOR_KEY = Read-SelectedKey 'Doctor' '1' $true $false
+                $env:CP_DOCTOR_KEY = Read-SelectedKey 'Doctor' '2' $true $false
             }
             $responses = (Read-Choice 'Doctor Responses API? y/n' 'n' @('y', 'n')) -eq 'y'
             $workers = Read-Positive 'Inference parallel workers' 1
@@ -731,7 +731,7 @@ try {
             $env:CP_EVALUATOR_KEY = Resolve-DotEnvKey $dotEnvValues 'evaluator' $evalModel $evalUrl
         }
         elseif ($mode -eq '1') {
-            $env:CP_EVALUATOR_KEY = Read-SelectedKey 'Evaluator' '1' $true $true
+            $env:CP_EVALUATOR_KEY = Read-SelectedKey 'Evaluator' '2' $true $true
         } else { $env:CP_EVALUATOR_KEY = Read-Key 'Enter evaluator API key (hidden)' }
         $evalWorkers = Read-Positive 'Evaluation max workers' 4
         $outputPath = Resolve-EvaluationOutput $outputPath
