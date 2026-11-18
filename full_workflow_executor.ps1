@@ -1,11 +1,68 @@
 # Run from any directory; Enter selects the displayed default; Ctrl+C cancels.
 # Python output is filtered because it can contain keys or patient data.
+if ($env:OS -eq 'Windows_NT') {
+    Write-Host 'Windows 11 launch: .\full_workflow_executor.ps1'
+}
+else {
+    Write-Host 'macOS launch: install PowerShell 7, then run: pwsh ./full_workflow_executor.ps1'
+}
+Write-Host 'Prerequisites: system Python 3.12 or 3.13 and PowerShell. First run installs dependencies into .python-packages; no virtual environment or global Python install is used.'
 $savedErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
-$python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'
-$envNames = @('CP_WORKFLOW_CONFIG', 'CP_PATIENT_KEY', 'CP_DOCTOR_KEY', 'CP_EVALUATOR_KEY')
+$pythonCommand = $null
+$pythonPrefix = @()
+$pythonVersion = $null
+$candidates = @()
+if (Get-Command py -ErrorAction SilentlyContinue) {
+    $candidates += [pscustomobject]@{ Command = 'py'; Prefix = @('-3.12') }
+    $candidates += [pscustomobject]@{ Command = 'py'; Prefix = @('-3.13') }
+}
+foreach ($name in @('python3.12', 'python3.13', 'python3', 'python')) {
+    $command = Get-Command $name -ErrorAction SilentlyContinue
+    if ($command) { $candidates += [pscustomobject]@{ Command = $command.Source; Prefix = @() } }
+}
+foreach ($candidate in $candidates) {
+    $versionArgs = @($candidate.Prefix) + @('-c', 'import sys; print(sys.version_info[0], sys.version_info[1])')
+    $version = & $candidate.Command @versionArgs 2>$null
+    if ($LASTEXITCODE -eq 0 -and [string]$version -match '^3\s+(12|13)$') {
+        $pythonCommand = $candidate.Command
+        $pythonPrefix = @($candidate.Prefix)
+        $pythonVersion = ([string]$version -replace '\s+', '.')
+        break
+    }
+}
+if (-not $pythonCommand) {
+    throw 'Python 3.12 or 3.13 is required. Install one system-wide, then rerun; this script does not create a virtual environment.'
+}
+
+$requirements = Join-Path $PSScriptRoot 'requirements.txt'
+$packagePath = Join-Path $PSScriptRoot '.python-packages'
+$packageMarker = Join-Path $packagePath '.requirements-sha256'
+$requirementsHash = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash
+$optionalPackages = @('langchain-community==0.3.31', 'wikipedia==1.4.0', 'xmltodict==0.14.2')
+$expectedMarker = "$pythonVersion`:$requirementsHash`:$($optionalPackages -join ';')"
+if (-not (Test-Path -LiteralPath $packageMarker) -or
+    (Get-Content -LiteralPath $packageMarker -Raw).Trim() -ne $expectedMarker) {
+    Write-Host "Installing pinned Python dependencies into repo-local .python-packages with system Python $pythonVersion (no virtual environment or global package install)."
+    New-Item -ItemType Directory -Force -Path $packagePath | Out-Null
+    $installArgs = @($pythonPrefix) + @('-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', '--upgrade', '--target', $packagePath, '-r', $requirements) + $optionalPackages
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $installOutput = @(& $pythonCommand @installArgs 2>&1)
+        $installExitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $previousPreference }
+    if ($installExitCode -ne 0) {
+        throw 'Dependency installation failed. Check internet access and that Python 3.12/3.13 includes pip; no virtual environment was created.'
+    }
+    Set-Content -LiteralPath $packageMarker -Value $expectedMarker -Encoding ASCII
+}
+$python = $pythonCommand
+$envNames = @('CP_WORKFLOW_CONFIG', 'CP_PATIENT_KEY', 'CP_DOCTOR_KEY', 'CP_EVALUATOR_KEY', 'CP_LOCAL_PACKAGES')
 $savedEnvironment = @{}
 foreach ($name in $envNames) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+$env:CP_LOCAL_PACKAGES = $packagePath
 
 function Read-Default([string]$Label, [string]$Default) {
     $value = Read-Host "$Label [$Default]"
@@ -127,6 +184,9 @@ import sys
 
 cfg = json.loads(os.environ['CP_WORKFLOW_CONFIG'])
 action = cfg['action']
+local_packages = os.environ.get('CP_LOCAL_PACKAGES')
+if local_packages:
+    sys.path.insert(0, local_packages)
 sys.path.insert(0, os.path.abspath('codes'))
 categories = {'AuthenticationError', 'BadRequestError', 'APIConnectionError',
               'APITimeoutError', 'RateLimitError', 'InternalServerError',
@@ -425,7 +485,7 @@ function Invoke-Runner([hashtable]$Config) {
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $output = @($runner | & $python - 2>&1)
+        $output = @($runner | & $pythonCommand @pythonPrefix - 2>&1)
         $code = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $previousPreference }
@@ -485,7 +545,7 @@ function Invoke-Runner([hashtable]$Config) {
 }
 
 try {
-    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Python virtual environment not found at .venv\Scripts\python.exe; create the venv and install requirements first.' }
+    Write-Host "Using system Python $pythonVersion; dependencies are isolated under .python-packages (no virtual environment)."
     Push-Location -LiteralPath $PSScriptRoot
     try {
         Write-Host '1 Inference + evaluation | 2 Inference only | 3 Evaluate existing inference | 4 Statistics only | 0 Quit'
