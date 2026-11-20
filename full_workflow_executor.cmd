@@ -1,7 +1,17 @@
+@echo off
+setlocal DisableDelayedExpansion
+set "errorlevel="
+set "CP_WORKFLOW_LAUNCHER=%~f0"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$code = 1; $temp = $null; try { $policies = @(Get-ExecutionPolicy -List); if (@($policies | Where-Object { $_.Scope -in @('MachinePolicy','UserPolicy') -and $_.ExecutionPolicy -ne 'Undefined' }).Count -gt 0) { Write-Warning 'A managed execution policy may override this process-level bypass.' }; $content = [IO.File]::ReadAllText($env:CP_WORKFLOW_LAUNCHER, [Text.Encoding]::UTF8).Replace(([string][char]13 + [char]10), ([string][char]10)); $marker = (([string][char]10) + ':__POWERSHELL__' + [char]10); $position = $content.IndexOf($marker, [StringComparison]::Ordinal); if ($position -lt 0) { throw 'Readable PowerShell section not found.' }; $script = $content.Substring($position + $marker.Length); $tempPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($env:CP_WORKFLOW_LAUNCHER), ('.full_workflow_executor-' + [guid]::NewGuid().ToString('N') + '.ps1')); $file = [IO.File]::Open($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $temp = $tempPath; try { $encoding = New-Object Text.UTF8Encoding($true); $bom = $encoding.GetPreamble(); $file.Write($bom, 0, $bom.Length); $bytes = $encoding.GetBytes($script); $file.Write($bytes, 0, $bytes.Length) } finally { $file.Dispose() }; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $temp; $code = $LASTEXITCODE } catch { [Console]::Error.WriteLine('Launcher failed: ' + $_.Exception.Message); $code = 1 } finally { if ($null -ne $temp) { try { Remove-Item -LiteralPath $temp -Force -ErrorAction Stop } catch { Write-Warning ('Could not remove temporary script: ' + $temp) } } }; exit $code"
+set "CP_WORKFLOW_EXIT_CODE=%errorlevel%"
+echo.
+set /p "CP_WORKFLOW_CLOSE=Press Enter to close..."
+exit /b %CP_WORKFLOW_EXIT_CODE%
+:__POWERSHELL__
 # Run from any directory; Enter selects the displayed default; Ctrl+C cancels.
 # Python output is filtered because it can contain keys or patient data.
 if ($env:OS -eq 'Windows_NT') {
-    Write-Host 'Windows 11 launch: .\full_workflow_executor.ps1'
+    Write-Host 'Windows launch: .\full_workflow_executor.cmd'
 }
 else {
     Write-Host 'macOS launch: install PowerShell 7, then run: pwsh ./full_workflow_executor.ps1'
@@ -231,10 +241,10 @@ function Backup-Artifact([string]$Path, [bool]$Move) {
     else { Copy-Item -LiteralPath $Path -Destination $backup }
     Write-Host 'Existing artifact preserved in a uniquely named backup.'
 }
-
 # Only fixed code is piped to Python. Options and keys travel in the process
 # environment, never interpolated into code or exposed in an OS command line.
 $runner = @'
+import ast
 import contextlib
 import io
 import json
@@ -344,16 +354,6 @@ def validate_scores(items, strict=False):
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError('Invalid score')
 
-def verify_originals():
-    paths = ['codes/inference.py', 'codes/evaluation.py', 'codes/pipeline.py',
-             'codes/utils/agents.py', 'codes/utils/tools.py', 'codes/utils/mdt.py',
-             'codes/utils/run_context.py', 'codes/utils/tool_manager.py', 'requirements.txt']
-    for path in paths:
-        for command in (['git', 'ls-files', '--error-unmatch', '--', path],
-                        ['git', 'diff', '--quiet', 'HEAD', '--', path]):
-            if subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
-                raise RuntimeError('Tracked original files must match HEAD')
-
 def patch_chat():
     from openai.resources.chat.completions import Completions
     from openai.resources.responses import Responses
@@ -386,6 +386,14 @@ def patch_inference_errors():
     from concurrent.futures import Future
     import pipeline
     from utils.tool_manager import ToolManager
+    from utils.run_context import RunContext
+    import threading
+    write_lock = threading.Lock()
+    original_write = RunContext.output_agent_results
+    def locked_write(self):
+        with write_lock:
+            return original_write(self)
+    RunContext.output_agent_results = locked_write
     original_talk = pipeline.talk_with_doctor
     original_tool = ToolManager.call_tool
     original_result = Future.result
@@ -411,12 +419,43 @@ def patch_inference_errors():
     ToolManager.call_tool = tool
     Future.result = result
 
+def run_inference_with_paths(result_path, log_path):
+    """Set run-specific paths in memory, without modifying inference.py."""
+    path = 'codes/inference.py'
+    with open(path, encoding='utf-8-sig') as source:
+        tree = ast.parse(source.read(), filename=path)
+    args_classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Args']
+    if len(args_classes) != 1:
+        raise RuntimeError('Inference Args class could not be located')
+    initializers = [node for node in args_classes[0].body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == '__init__']
+    if len(initializers) != 1:
+        raise RuntimeError('Inference Args initializer could not be located')
+    assignments = [node for node in initializers[0].body if isinstance(node, ast.Assign) and any(
+        isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == 'self' and target.attr == 'output_path'
+        for target in node.targets)]
+    log_calls = [node for node in tree.body if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute) and isinstance(node.value.func.value, ast.Name)
+        and node.value.func.value.id == 'logging' and node.value.func.attr == 'basicConfig']
+    if len(assignments) != 1 or len(log_calls) != 1:
+        raise RuntimeError('Inference output or logging configuration could not be located')
+    filenames = [keyword for keyword in log_calls[0].value.keywords if keyword.arg == 'filename']
+    if len(filenames) != 1:
+        raise RuntimeError('Inference log filename could not be located')
+    if os.path.exists(result_path) or os.path.exists(log_path):
+        raise RuntimeError('Run-specific output or log already exists')
+    assignments[0].value = ast.copy_location(ast.Constant(value=result_path), assignments[0].value)
+    filenames[0].value = ast.copy_location(ast.Constant(value=log_path), filenames[0].value)
+    ast.fix_missing_locations(tree)
+    namespace = {'__name__': '__main__', '__file__': os.path.abspath(path), '__package__': None}
+    exec(compile(tree, path, 'exec'), namespace)
+
 status = False
 diagnostic = None
 try:
     with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
         if action == 'verify':
-            verify_originals()
+            if not all(os.path.isfile(path) for path in ('codes/inference.py', 'codes/evaluation.py', 'codes/pipeline.py', 'codes/utils/agents.py', 'codes/utils/tools.py', 'codes/utils/mdt.py', 'codes/utils/run_context.py', 'codes/utils/tool_manager.py', 'requirements.txt')):
+                raise RuntimeError('Required workflow files are missing')
             status = True
         elif action == 'validate_input':
             stage = 'INPUT_VALIDATION'
@@ -434,24 +473,57 @@ try:
             stage = 'DATASET'
             import datasets
             load = datasets.load_dataset
-            first_ids = []
+            expected_cases = {}
+            def case_key(case):
+                return json.dumps(case['id'], sort_keys=True, ensure_ascii=False)
+            class SelectedDataset:
+                def __init__(self, dataset):
+                    self.dataset = dataset
+                def __len__(self):
+                    return len(self.dataset)
+                def __getitem__(self, key):
+                    return self.dataset[key]
+                def __iter__(self):
+                    return iter(self.dataset)
+                def select(self, ignored_indices, *args, **kwargs):
+                    global resumed, diagnostic
+                    try:
+                        count = cfg['case_count']
+                        if type(count) is not int or count < 1:
+                            raise ValueError('Invalid case count')
+                        if count > len(self.dataset):
+                            diagnostic = 'CASE_COUNT_EXCEEDS_DATASET'
+                            raise ValueError('Case count exceeds dataset size')
+                        selected = self.dataset.select(range(count), *args, **kwargs)
+                        if expected_cases:
+                            raise ValueError('Dataset was selected more than once')
+                        for case in selected:
+                            key = case_key(case)
+                            if key in expected_cases:
+                                raise ValueError('Duplicate case IDs in selected dataset')
+                            expected_cases[key] = case
+                        if os.path.exists(cfg['result']):
+                            existing = rows(cfg['result'])
+                            if existing:
+                                validate_inference(existing)
+                                seen = set()
+                                for item in existing:
+                                    case = item['original_data']
+                                    key = case_key(case)
+                                    if key in seen or key not in expected_cases or expected_cases[key] != case:
+                                        raise ValueError('Existing results do not match selected cases')
+                                    seen.add(key)
+                                resumed = True
+                        return selected
+                    except Exception as exc:
+                        record_failure('DATASET', exc)
+                        raise
             def checked_load(*args, **kwargs):
                 try:
                     data = load(*args, **kwargs)
                     if not len(data):
                         raise ValueError('Dataset is empty')
-                    first_case = data[0]
-                    first_id = first_case['id']
-                    first_ids.append(first_id)
-                    if os.path.exists(cfg['result']):
-                        existing = rows(cfg['result'])
-                        if existing:
-                            validate_inference(existing)
-                            if len(existing) != 1 or existing[0]['original_data'] != first_case:
-                                raise ValueError('Resume data does not match the first selected case')
-                            global resumed
-                            resumed = True
-                    return data
+                    return SelectedDataset(data)
                 except Exception as exc:
                     record_failure('DATASET', exc)
                     raise
@@ -467,13 +539,20 @@ try:
             if cfg['responses']:
                 sys.argv.append('--doctor_responses_api')
             stage = 'INFERENCE'
-            runpy.run_path('codes/inference.py', run_name='__main__')
+            run_inference_with_paths(cfg['result'], cfg['log_path'])
             stage = 'RESULT_VALIDATION'
             items = rows(cfg['result'])
             diagnostic = inference_diagnostic(items)
             validate_inference(items)
-            if len(first_ids) != 1 or len(items) != 1 or items[0]['original_data']['id'] != first_ids[0]:
-                raise ValueError('Result does not match the selected case')
+            actual_cases = {}
+            for item in items:
+                case = item['original_data']
+                key = case_key(case)
+                if key in actual_cases:
+                    raise ValueError('Duplicate result IDs')
+                actual_cases[key] = case
+            if not expected_cases or actual_cases != expected_cases:
+                raise ValueError('Results do not match all selected cases')
             text = captured_text()
             if 'Error processing data item:' in text or '--- ERROR DETECTED' in text:
                 raise RuntimeError('Inference reported an error')
@@ -595,8 +674,9 @@ function Invoke-Runner([hashtable]$Config) {
             Write-Host $line
             Write-Host 'The encounter limit appears to have been reached while the workflow was ongoing. On a fresh run, consider increasing Maximum encounters; choose backup and restart to retain the failed result.'
         }
+        elseif ($line -ceq 'SAFE_DIAGNOSTIC=CASE_COUNT_EXCEEDS_DATASET') { Write-Host 'The requested case count exceeds the dataset size; no cases were run.' }
         elseif ($line -ceq 'SAFE_DIAGNOSTIC=INCOMPLETE') { Write-Host $line; Write-Host 'The inference record is incomplete; the cause is not established.' }
-        elseif ($line -ceq 'SAFE_RESUMED=YES') { Write-Host 'Existing first-case result was reused; current inference settings may not have been applied.' }
+        elseif ($line -ceq 'SAFE_RESUMED=YES') { Write-Host 'Existing matching results were reused; current inference settings may not have been applied to those cases.' }
         elseif ($line -ceq 'SAFE_EVALUATION_API_FAILURES=YES') { Write-Host 'Warning: some evaluation API calls failed; fallback scores may have been used.' }
         elseif ($line -match '^SAFE_STAT=(\[(Clinical Efficacy|Process Competency|Professional Ethics)\]|(WC|DR@3|DR@5|TP|IS|LC|RC|IC|RU|PS|TI|ED|FP)\s*:\s*-?\d+(\.\d+)?|Total Cases Evaluated: \d+)$') { Write-Host $Matches[1] }
     }
@@ -614,7 +694,7 @@ try {
         Write-Host '1 Inference + evaluation | 2 Inference only | 3 Evaluate existing inference | 4 Statistics only | 0 Quit'
         $mode = Read-Choice 'Choose mode' '1' @('0', '1', '2', '3', '4')
         if ($mode -eq '0') { return }
-        if ($mode -ne '4' -and -not (Invoke-Runner @{ action = 'verify' })) { throw 'Cannot verify original tracked files against HEAD (or Git is unavailable); no workflow started.' }
+        if ($mode -ne '4' -and -not (Invoke-Runner @{ action = 'verify' })) { throw 'A required workflow file is missing; no workflow started.' }
         if ($mode -in @('1', '2')) {
             Write-Host 'Profiles: 1=Quick DeepSeek test (DeepSeek patient and doctor); 2=Paper-style patient setup (GPT-OSS patient, evaluated doctor).'
             $profile = Read-Choice 'Choose model profile' '1' @('1', '2')
@@ -636,8 +716,8 @@ try {
                 Write-Host 'Paper-style: the paper fixes GPT-OSS-120B as the patient model; it must already be served at the selected patient endpoint.'
                 Write-Host 'The evaluator default below follows this repository CLI; the paper does not clearly specify its evaluator model.'
             }
-            Write-Host 'Operational defaults: one inference worker to reduce API contention; original pathway limits are 8 encounters, 5 talk turns, 3 queries.'
-            Write-Host 'The original inference code selects only the first test-split case; model names determine its output filename.'
+            Write-Host 'Choose the case count and parallel workers separately; higher concurrency can increase API cost and rate limits.'
+            Write-Host 'The launcher selects the first requested cases regardless of the hardcoded range in inference.py.'
         }
         $credentialMode = $null
         $dotEnvValues = @{}
@@ -669,37 +749,25 @@ try {
                 $env:CP_DOCTOR_KEY = Read-SelectedKey 'Doctor' '2' $true $false
             }
             $responses = (Read-Choice 'Doctor Responses API? y/n' 'n' @('y', 'n')) -eq 'y'
-            $workers = Read-Positive 'Inference parallel workers' 1
+            $caseCount = Read-Positive 'Number of cases' 1
+            $workers = Read-Positive 'Inference parallel workers' 4
             $dataRepo = Read-Default 'Dataset repository or path' 'SII-SPIRAL-MED/DiagnosisArena'
             $encounters = Read-Positive 'Maximum encounters' 8
             $turns = Read-Positive 'Maximum talk turns' 5
             $queries = Read-Positive 'Maximum queries' 3
-            $inputPath = Join-Path $PSScriptRoot "outputs\P_$patientModel-D_$doctorModel-results.jsonl"
-            $logPath = Join-Path $PSScriptRoot "logs\mimic_process_$doctorModel.log"
+            $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+            $inputPath = Join-Path $PSScriptRoot "outputs\P_$patientModel-D_$doctorModel-$runId-results.jsonl"
+            $logPath = Join-Path $PSScriptRoot "logs\mimic_process_$doctorModel-$runId.log"
             Write-Host "Inference output: $inputPath"
-            if (Test-Path -LiteralPath $inputPath) {
-                if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) { throw 'Inference output path is not a file.' }
-                if ((Get-Item -LiteralPath $inputPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Inference output path is a link; refusing to write through it.' }
-                $choice = Read-Choice 'Existing inference: 1=resume, 2=backup and restart, 0=cancel' '2' @('0', '1', '2')
-                if ($choice -eq '0') { throw 'Cancelled; existing artifacts were not changed.' }
-                if ($choice -eq '1') {
-                    Write-Host 'Warning: the existing first-case result may be reused, not newly inferred. Endpoints, limits and Responses API settings cannot be verified and may not be applied.'
-                    if ((Read-Choice 'Acknowledge reuse and continue? y/n' 'n' @('y', 'n')) -ne 'y') { throw 'Cancelled; existing artifacts were not changed.' }
-                }
-                Backup-Artifact $inputPath ($choice -eq '2')
-            }
-            if (Test-Path -LiteralPath $logPath) {
-                if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) { throw 'Log path is not a file.' }
-                if ((Get-Item -LiteralPath $logPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Log path is a link; refusing to write through it.' }
-                Backup-Artifact $logPath $true
-            }
+            Write-Host "Inference log: $logPath"
+            if ((Test-Path -LiteralPath $inputPath) -or (Test-Path -LiteralPath $logPath)) { throw 'Run-specific output or log already exists; no workflow started.' }
             Write-Host 'Original logs may contain sensitive patient data; keep logs and backups private.'
-            Write-Host 'Starting the original inference/resume workflow; raw Python output is suppressed for safety.'
-            $config = @{ action='inference'; result=$inputPath; data_repo=$dataRepo; parallel_workers=$workers;
+            Write-Host 'Starting inference in new run-specific files; raw Python output is suppressed for safety.'
+            $config = @{ action='inference'; result=$inputPath; log_path=$logPath; data_repo=$dataRepo; parallel_workers=$workers; case_count=$caseCount;
                 patient_model=$patientModel; patient_url=$patientUrl; doctor_model=$doctorModel; doctor_url=$doctorUrl;
                 responses=$responses; max_encounters=$encounters; max_turns=$turns; max_queries=$queries }
-            if (-not (Invoke-Runner $config)) { throw 'Inference did not complete successfully. Artifacts were retained; evaluation was skipped. For a failed resume, choose backup and restart.' }
-            Write-Host 'First-case result verified successful (a matching existing result may have been reused).'
+            if (-not (Invoke-Runner $config)) { throw 'Inference did not complete successfully. Artifacts were retained; evaluation was skipped.' }
+            Write-Host 'All selected case results verified successful.'
             if ($mode -eq '2') { return }
         }
         if ($mode -eq '3') {
@@ -719,7 +787,8 @@ try {
             $allowFailed = (Read-Choice 'Allow evaluation of failed records? y/n' 'n' @('y', 'n')) -eq 'y'
         }
         if (-not (Invoke-Runner @{ action='validate_input'; input=$inputPath; allow_failed=$allowFailed })) { throw 'Inference input is invalid, empty, or contains failed cases; evaluation was skipped.' }
-        $defaultOutput = Join-Path $PSScriptRoot ('outputs\evaluation-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.jsonl')
+        $evaluationId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+        $defaultOutput = Join-Path $PSScriptRoot ('outputs\evaluation-' + $evaluationId + '.jsonl')
         $outputPath = Resolve-EvaluationOutput (Read-Default 'Evaluation output JSONL path' $defaultOutput)
         if ($outputPath -ieq $inputPath) { throw 'Evaluation output must differ from inference input.' }
         if (-not (Invoke-Runner @{ action='check_output'; input=$inputPath; output=$outputPath })) { throw 'Evaluation output must differ from inference input, including links.' }
@@ -753,8 +822,8 @@ try {
     finally { Pop-Location }
 }
 catch {
-    $safeMessages = @('Python virtual environment not found', 'Cannot verify original tracked files', 'Input cancelled',
-        'No API key entered', 'Inference output path is not a file', 'Inference output path is a link', 'Log path is not a file', 'Log path is a link', 'Cancelled;',
+    $safeMessages = @('Python virtual environment not found', 'A required workflow file is missing', 'Input cancelled',
+        'No API key entered', 'Run-specific output or log already exists', 'Cancelled;',
         'Inference did not complete successfully', 'Inference input file not found', 'Inference input is invalid', 'Evaluation file not found',
         'Statistics could not be calculated', 'Evaluation output must differ', 'Evaluation output cannot', 'Evaluation output must be', 'Evaluation output parent directory', 'Evaluation output unexpectedly exists',
         'Evaluation output path is not a file', 'Evaluation did not complete successfully', 'A file path is required')
