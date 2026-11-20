@@ -2,7 +2,7 @@
 setlocal DisableDelayedExpansion
 set "errorlevel="
 set "CP_WORKFLOW_LAUNCHER=%~f0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$code = 1; $temp = $null; try { $policies = @(Get-ExecutionPolicy -List); if (@($policies | Where-Object { $_.Scope -in @('MachinePolicy','UserPolicy') -and $_.ExecutionPolicy -ne 'Undefined' }).Count -gt 0) { Write-Warning 'A managed execution policy may override this process-level bypass.' }; $content = [IO.File]::ReadAllText($env:CP_WORKFLOW_LAUNCHER, [Text.Encoding]::UTF8).Replace(([string][char]13 + [char]10), ([string][char]10)); $marker = (([string][char]10) + ':__POWERSHELL__' + [char]10); $position = $content.IndexOf($marker, [StringComparison]::Ordinal); if ($position -lt 0) { throw 'Readable PowerShell section not found.' }; $script = $content.Substring($position + $marker.Length); $tempPath = [IO.Path]::Combine([IO.Path]::GetDirectoryName($env:CP_WORKFLOW_LAUNCHER), ('.full_workflow_executor-' + [guid]::NewGuid().ToString('N') + '.ps1')); $file = [IO.File]::Open($tempPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); $temp = $tempPath; try { $encoding = New-Object Text.UTF8Encoding($true); $bom = $encoding.GetPreamble(); $file.Write($bom, 0, $bom.Length); $bytes = $encoding.GetBytes($script); $file.Write($bytes, 0, $bytes.Length) } finally { $file.Dispose() }; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $temp; $code = $LASTEXITCODE } catch { [Console]::Error.WriteLine('Launcher failed: ' + $_.Exception.Message); $code = 1 } finally { if ($null -ne $temp) { try { Remove-Item -LiteralPath $temp -Force -ErrorAction Stop } catch { Write-Warning ('Could not remove temporary script: ' + $temp) } } }; exit $code"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $code = 1; try { $policies = @(Get-ExecutionPolicy -List); if (@($policies | Where-Object { $_.Scope -in @('MachinePolicy','UserPolicy') -and $_.ExecutionPolicy -ne 'Undefined' }).Count -gt 0) { Write-Warning 'A managed execution policy may override this process-level bypass.' }; $content = [IO.File]::ReadAllText($env:CP_WORKFLOW_LAUNCHER, [Text.Encoding]::UTF8).Replace(([string][char]13 + [char]10), ([string][char]10)); $marker = (([string][char]10) + ':__POWERSHELL__' + [char]10); $position = $content.IndexOf($marker, [StringComparison]::Ordinal); if ($position -lt 0) { throw 'Readable PowerShell section not found.' }; $script = $content.Substring($position + $marker.Length); $global:LASTEXITCODE = 0; & ([scriptblock]::Create($script)); $code = $global:LASTEXITCODE } catch { [Console]::Error.WriteLine('Launcher failed: ' + $_.Exception.Message); $code = 1 }; exit $code"
 set "CP_WORKFLOW_EXIT_CODE=%errorlevel%"
 echo.
 set /p "CP_WORKFLOW_CLOSE=Press Enter to close..."
@@ -10,6 +10,7 @@ exit /b %CP_WORKFLOW_EXIT_CODE%
 :__POWERSHELL__
 # Run from any directory; Enter selects the displayed default; Ctrl+C cancels.
 # Python output is filtered because it can contain keys or patient data.
+$workflowRoot = [IO.Path]::GetDirectoryName($env:CP_WORKFLOW_LAUNCHER)
 if ($env:OS -eq 'Windows_NT') {
     Write-Host 'Windows launch: .\full_workflow_executor.cmd'
 }
@@ -21,7 +22,7 @@ $savedErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
 
 # Keep credentials and launcher-installed dependencies out of Git after a fresh clone.
-$gitignorePath = Join-Path $PSScriptRoot '.gitignore'
+$gitignorePath = Join-Path $workflowRoot '.gitignore'
 $requiredIgnoreRules = @('.env', '.env.*', '.venv/', 'venv/', '.python-packages/', '__pycache__/', '*.py[cod]')
 if (Test-Path -LiteralPath $gitignorePath) {
     $gitignoreItem = Get-Item -LiteralPath $gitignorePath -Force
@@ -67,8 +68,8 @@ if (-not $pythonCommand) {
     throw 'Python 3.12 or 3.13 is required. Install one system-wide, then rerun; this script does not create a virtual environment.'
 }
 
-$requirements = Join-Path $PSScriptRoot 'requirements.txt'
-$packagePath = Join-Path $PSScriptRoot '.python-packages'
+$requirements = Join-Path $workflowRoot 'requirements.txt'
+$packagePath = Join-Path $workflowRoot '.python-packages'
 $packageMarker = Join-Path $packagePath '.requirements-sha256'
 $requirementsHash = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash
 $optionalPackages = @('langchain-community==0.3.31', 'wikipedia==1.4.0', 'xmltodict==0.14.2')
@@ -154,7 +155,7 @@ function Read-Key([string]$Label) {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr); $secure.Dispose() }
 }
 function Read-DotEnv {
-    $path = Join-Path $PSScriptRoot '.env'
+    $path = Join-Path $workflowRoot '.env'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw '.env was selected but no .env file exists in the repository folder.'
     }
@@ -209,12 +210,12 @@ function Read-SelectedKey([string]$Role, [string]$Default, [bool]$HasPatient, [b
 function Resolve-WorkspacePath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { throw 'A file path is required.' }
     if ([IO.Path]::IsPathRooted($Path)) { return [IO.Path]::GetFullPath($Path) }
-    return [IO.Path]::GetFullPath((Join-Path $PSScriptRoot $Path))
+    return [IO.Path]::GetFullPath((Join-Path $workflowRoot $Path))
 }
 function Resolve-EvaluationOutput([string]$Path) {
     if ($Path -split '[\\/]' -contains '..') { throw 'Evaluation output cannot contain path traversal.' }
     $resolved = Resolve-WorkspacePath $Path
-    $outputs = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'outputs')).TrimEnd([char[]]'\/')
+    $outputs = [IO.Path]::GetFullPath((Join-Path $workflowRoot 'outputs')).TrimEnd([char[]]'\/')
     if (-not $resolved.StartsWith($outputs + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
         [IO.Path]::GetExtension($resolved) -ine '.jsonl' -or
         $resolved.Substring([IO.Path]::GetPathRoot($resolved).Length).Contains(':')) {
@@ -689,7 +690,7 @@ function Invoke-Runner([hashtable]$Config) {
 
 try {
     Write-Host "Using system Python $pythonVersion; dependencies are isolated under .python-packages (no virtual environment)."
-    Push-Location -LiteralPath $PSScriptRoot
+    Push-Location -LiteralPath $workflowRoot
     try {
         Write-Host '1 Inference + evaluation | 2 Inference only | 3 Evaluate existing inference | 4 Statistics only | 0 Quit'
         $mode = Read-Choice 'Choose mode' '1' @('0', '1', '2', '3', '4')
@@ -756,8 +757,8 @@ try {
             $turns = Read-Positive 'Maximum talk turns' 5
             $queries = Read-Positive 'Maximum queries' 3
             $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
-            $inputPath = Join-Path $PSScriptRoot "outputs\P_$patientModel-D_$doctorModel-$runId-results.jsonl"
-            $logPath = Join-Path $PSScriptRoot "logs\mimic_process_$doctorModel-$runId.log"
+            $inputPath = Join-Path $workflowRoot "outputs\P_$patientModel-D_$doctorModel-$runId-results.jsonl"
+            $logPath = Join-Path $workflowRoot "logs\mimic_process_$doctorModel-$runId.log"
             Write-Host "Inference output: $inputPath"
             Write-Host "Inference log: $logPath"
             if ((Test-Path -LiteralPath $inputPath) -or (Test-Path -LiteralPath $logPath)) { throw 'Run-specific output or log already exists; no workflow started.' }
@@ -788,7 +789,7 @@ try {
         }
         if (-not (Invoke-Runner @{ action='validate_input'; input=$inputPath; allow_failed=$allowFailed })) { throw 'Inference input is invalid, empty, or contains failed cases; evaluation was skipped.' }
         $evaluationId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
-        $defaultOutput = Join-Path $PSScriptRoot ('outputs\evaluation-' + $evaluationId + '.jsonl')
+        $defaultOutput = Join-Path $workflowRoot ('outputs\evaluation-' + $evaluationId + '.jsonl')
         $outputPath = Resolve-EvaluationOutput (Read-Default 'Evaluation output JSONL path' $defaultOutput)
         if ($outputPath -ieq $inputPath) { throw 'Evaluation output must differ from inference input.' }
         if (-not (Invoke-Runner @{ action='check_output'; input=$inputPath; output=$outputPath })) { throw 'Evaluation output must differ from inference input, including links.' }
