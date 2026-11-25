@@ -19,6 +19,7 @@ class RunContext:
     # --- Source Data ---
     data_item: dict
     output_path: str
+    case_memory: object = field(default=None, init=False, repr=False)
     
     # --- Internal Agents & Tools ---
     patient_client: OpenAI = field(init=False)

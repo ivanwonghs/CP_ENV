@@ -6,6 +6,7 @@ It manages the interaction between a 'Patient Agent' (simulating a specific medi
 """
 
 
+import ast
 import re
 import json
 import logging
@@ -29,6 +30,98 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _remember(context, kind, text, source_kind, event_id, detail=""):
+    """Record only observed events; never log failed event contents."""
+    if getattr(context, "case_memory", None) is None:
+        return
+    try:
+        from fhir_memory import Source
+        context.case_memory.add(kind, text, Source(source_kind, event_id, detail))
+    except Exception:
+        logger.warning("Case memory update failed; continuing without this event.")
+
+
+def _completed_tests_section(records, max_chars=1000):
+    """List completed test names in record order, without copying results."""
+    names = []
+    seen = set()
+    for record in records:
+        if not isinstance(record, dict) or record.get("Recording Department") != "diagnostic_test":
+            continue
+        tests = record.get("Completed Tests")
+        if isinstance(tests, str):
+            try:
+                tests = ast.literal_eval(tests)
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                continue
+        if not isinstance(tests, (list, tuple)):
+            continue
+        for test in tests:
+            if not isinstance(test, str):
+                continue
+            name = " ".join(test.split())
+            key = name.casefold()
+            if name and key not in seen:
+                names.append(name)
+                seen.add(key)
+
+    header = "Completed Tests (names only; use get_info for reports):\n"
+    if not names:
+        return header + "(none)"
+    lines = ["- " + json.dumps(name, ensure_ascii=False) for name in names]
+    complete = header + "\n".join(lines)
+    if len(complete) <= max_chars:
+        return complete
+
+    marker = "[additional completed tests omitted]"
+    remaining = max_chars - len(header) - len(marker)
+    selected = []
+    for line in lines:
+        if len(line) + 1 <= remaining:
+            selected.append(line)
+            remaining -= len(line) + 1
+    return header + ("\n".join(selected) + "\n" if selected else "") + marker
+
+
+def _atr_specialist_record(context):
+    """Keep the original handoff and add only available test names, if any."""
+    record = str(context.patient_records_simplified)
+    tests = _completed_tests_section(context.patient_records_simplified)
+    if tests == _completed_tests_section([]):
+        return record
+    return (record + "\n\n" + tests + "\n"
+            "If relevant, use get_info to retrieve available test reports before final diagnosis.")
+
+
+def _remember_report(context, report, event_id):
+    _remember(context, "clinic_note", report["clinic_note"], "clinic_note", event_id)
+
+
+def _remember_doctor(context, text, event_id):
+    if getattr(context, "case_memory", None) is None:
+        return
+    text = re.sub(r"<think>.*?</think>|<seed:think>.*?</seed:think>", "", text, flags=re.DOTALL).strip()
+    _remember(context, "doctor_statement", text, "doctor_dialogue", event_id)
+
+
+def _remember_final(context, result, event_id):
+    _remember(context, "diagnosis", json.dumps(result["final_diagnosis"], ensure_ascii=False), "diagnosis", event_id)
+    _remember(context, "treatment_plan", str(result["treatment_plan"]), "treatment_plan", event_id)
+
+
+def _record_tool_usage(context, now_talkturn_diaglogue, usage, encounter_turns, turn):
+    if not usage:
+        return
+    now_talkturn_diaglogue["tool"] = usage.copy()
+    for tool_info in usage:
+        tool_info["encounter_turn"] = encounter_turns
+        context.tool_usages.append(tool_info)
+        if getattr(context, "case_memory", None) is not None:
+            _remember(context, "tool_result", str(tool_info.get("content", tool_info.get("output", ""))),
+                      "tool_result", f"encounter-{encounter_turns}-turn-{turn}-tool-{len(context.tool_usages)}",
+                      str(tool_info.get("name", "")))
 
 
 def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, encounter_turns: int) -> bool:
@@ -87,9 +180,14 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
         tests = test_itemize_agent.chat(Prompts.prompts[doctor_role]["itemize"].replace("INSERT_TESTS_HERE", task))
         tests = re.findall(r"```json(.*?)```", tests, flags=re.DOTALL)[0].strip()
         tests = json.loads(tests)
+
+        if getattr(context, "case_memory", None) is not None:
+            for index, test in enumerate(tests):
+                _remember(context, "test_order", test, "test_order", f"encounter-{encounter_turns}-test-{index}")
         
         # 2. Define helper to simulate a single test execution.
-        def mimic_test(test_name: str):
+        def mimic_test(indexed_test):
+            index, test_name = indexed_test
             test_agent = PatientAgent(llm_client=context.patient_client, llm_model=args.patient_model_name)
             test_instruction = Prompts.prompts[doctor_role]["test"].replace("INSERT_TEST_HERE", test_name).replace("INSERT_CASE_HERE", context.patient_agent.whole_case)
             result = test_agent.chat(test_instruction)
@@ -104,11 +202,14 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 "test_result": result,
                 # "test_report": report
             })
+            if getattr(context, "case_memory", None) is not None:
+                _remember(context, "test_result", json.dumps({"test_name": test_name, "test_result": result}, ensure_ascii=False),
+                          "test_result", f"encounter-{encounter_turns}-test-{index}", "simulator/generated")
             logger.info(f"\n--- {doctor_role} ---:  {context.diagnosis_reports[-1]}\n")
             
         # 3. Execute tests concurrently to simulate parallel lab work.
         with ThreadPoolExecutor(max_workers = 8) as executor:
-            list(executor.map(mimic_test, tests))
+            list(executor.map(mimic_test, enumerate(tests)))
         
         # 4. Record the completed tests in the patient records.
         context.patient_records.append({
@@ -149,11 +250,24 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 instruction = Prompts.prompts[doctor_role]["doctor"].replace("INSERT_QUERYNUMS_HERE", str(args.max_query_nums)).replace("INSERT_TURNS_HERE",str(args.max_talk_turns))
             elif doctor_role == "specialist_consultation":
                 instruction = Prompts.prompts[doctor_role]["doctor"].replace("INSERT_QUERYNUMS_HERE", str(args.max_query_nums)).replace("INSERT_TURNS_HERE",str(args.max_talk_turns))
-                instruction = instruction.replace("INSERT_DEPARTMENT_HERE", context.patient_records[1]["suggestion"]).replace("INSERT_RECORD_HERE", str(context.patient_records_simplified))
+                if not getattr(args, "baseline", False):
+                    record = _atr_specialist_record(context)
+                else:
+                    record = str(context.patient_records_simplified)
+                instruction = instruction.replace("INSERT_DEPARTMENT_HERE", context.patient_records[1]["suggestion"]).replace("INSERT_RECORD_HERE", record)
             logger.info(f"\n--- {doctor_role} --- doctor_prompt ---:  {instruction}\n")
             
-            # Generate the Doctor's opening statement.
-            doctor_talk = doctor_agent.chat(instruction)
+            # ATR can use existing tools at the
+            # first follow-up turn, when completed reports are already listed.
+            opening_tools = (doctor_role == "specialist_consultation" and
+                             not getattr(args, "baseline", False) and
+                             _completed_tests_section(context.patient_records_simplified) != _completed_tests_section([]))
+            if opening_tools:
+                opening_usage = []
+                doctor_talk = doctor_agent.chat(instruction, opening_usage, True)
+                _record_tool_usage(context, now_talkturn_diaglogue, opening_usage, encounter_turns, i + 1)
+            else:
+                doctor_talk = doctor_agent.chat(instruction)
             now_talkturn_diaglogue["turn"] = i + 1
             now_talkturn_diaglogue["doctor"] = doctor_talk
             logger.info(f"\n---{doctor_role} --- doctor_talk---:  {doctor_talk}\n")
@@ -170,9 +284,9 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             if re.search(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL):
                 report = re.findall(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL)[0].strip()
                 report = json.loads(report)
-
                 report.update({"Recording Department": doctor_role})
                 context.patient_records.append(report)
+                _remember_report(context, report, f"encounter-{encounter_turns}-report")
                 
                 report_simplified = {
                     "Recording Department": doctor_role,
@@ -192,6 +306,8 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                     result = doctor_agent.chat(Prompts.prompts["end_of_diagnosis"])
                     result = re.findall(r"```json(.*?)```", result, flags=re.DOTALL)[0].strip()
                     result = json.loads(result)
+                    if getattr(context, "case_memory", None) is not None:
+                        _remember_final(context, result, f"encounter-{encounter_turns}-final")
                     context.patient_records.append({
                         "Recording Department": "end_of_diagnosis",
                         "final_diagnosis": result["final_diagnosis"],
@@ -199,6 +315,7 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                     })
                 return True
             
+            _remember_doctor(context, doctor_talk_to_patient, f"encounter-{encounter_turns}-turn-{i+1}")
             # Generate Patient's response to the opening statement.
             if doctor_role == "registration":
                 instruction = Prompts.prompts[doctor_role]["patient"].replace("INSERT_QUERY_HERE", doctor_talk_to_patient)
@@ -208,6 +325,7 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 instruction = Prompts.prompts[doctor_role]["patient"].replace("INSERT_QUERY_HERE", doctor_talk_to_patient).replace("INSERT_DEPARTMENT_HERE", context.patient_records[1]["suggestion"])
                 patient_talk = context.patient_agent.chat(instruction)
                 # logger.info(f"\n--- {doctor_role} --- patient_prompt ---:  {instruction}\n")
+            _remember(context, "patient_statement", patient_talk, "patient_dialogue", f"encounter-{encounter_turns}-turn-{i+1}")
             now_talkturn_diaglogue["patient"] = patient_talk
             logger.info(f"\n--- patient_talk ---:  {patient_talk}\n")
             
@@ -219,11 +337,7 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             now_talkturn_diaglogue["turn"] = i + 1
             
             # Record tool usage if any occurred.
-            if now_tool_usage_info:
-                now_talkturn_diaglogue["tool"] = now_tool_usage_info.copy()
-                for tool_info in now_tool_usage_info:
-                    tool_info["encounter_turn"] = encounter_turns
-                    context.tool_usages.append(tool_info)
+            _record_tool_usage(context, now_talkturn_diaglogue, now_tool_usage_info, encounter_turns, i + 1)
             now_talkturn_diaglogue["doctor"] = doctor_talk
             logger.info(f"\n--- {doctor_role} --- doctor_talk ---:  {doctor_talk}\n")
 
@@ -239,9 +353,9 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
             if re.search(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL):
                 report = re.findall(r"```json(.*?)```", doctor_talk_to_patient, flags=re.DOTALL)[0].strip()
                 report = json.loads(report)
-
                 report.update({"Recording Department": doctor_role})
                 context.patient_records.append(report)
+                _remember_report(context, report, f"encounter-{encounter_turns}-report")
                 
                 report_simplified = {
                     "Recording Department": doctor_role,
@@ -261,6 +375,8 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                     result = doctor_agent.chat(Prompts.prompts["end_of_diagnosis"])
                     result = re.findall(r"```json(.*?)```", result, flags=re.DOTALL)[0].strip()
                     result = json.loads(result)
+                    if getattr(context, "case_memory", None) is not None:
+                        _remember_final(context, result, f"encounter-{encounter_turns}-final")
                     context.patient_records.append({
                         "Recording Department": "end_of_diagnosis",
                         "final_diagnosis": result["final_diagnosis"],
@@ -269,7 +385,9 @@ def talk_with_doctor(args: "Args", context: "RunContext", doctor_role: str, enco
                 return True
             
             # If no conclusion, the Patient responds to continue the dialogue.
+            _remember_doctor(context, doctor_talk_to_patient, f"encounter-{encounter_turns}-turn-{i+1}")
             patient_talk = context.patient_agent.chat(doctor_talk_to_patient)
+            _remember(context, "patient_statement", patient_talk, "patient_dialogue", f"encounter-{encounter_turns}-turn-{i+1}")
             now_talkturn_diaglogue["patient"] = patient_talk
             logger.info(f"\n--- patient_talk ---:  {patient_talk}\n")
             
@@ -285,6 +403,13 @@ def run_pipeline(args: "Args", context: "RunContext") -> "RunContext":
     Orchestrates the entire simulation pipeline for a specific medical case.
     Initializes agents, tools, and manages the lifecycle of encounters.
     """
+    memory_enabled = (not getattr(args, "baseline", False) and
+                      getattr(args, "use_fhir_memory", not getattr(args, "baseline", False)))
+    if memory_enabled:
+        from fhir_memory import CaseMemory
+        context.case_memory = CaseMemory(str(context.data_item['id']))
+    else:
+        context.case_memory = None
     
     # --- Register Patient Agent ---
     # Construct case information string for the agent's context.

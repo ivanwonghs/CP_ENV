@@ -69,9 +69,12 @@ if (-not $pythonCommand) {
 }
 
 $requirements = Join-Path $workflowRoot 'requirements.txt'
-$packagePath = Join-Path $workflowRoot '.python-packages'
-$packageMarker = Join-Path $packagePath '.requirements-sha256'
 $requirementsHash = (Get-FileHash -LiteralPath $requirements -Algorithm SHA256).Hash
+$packageRoot = Join-Path $workflowRoot '.python-packages'
+# Use a requirements-specific path so stale or interrupted older installs cannot
+# shadow this run's dependencies. Existing package directories are retained.
+$packagePath = Join-Path $packageRoot ('py' + $pythonVersion + '-' + $requirementsHash.Substring(0, 16))
+$packageMarker = Join-Path $packagePath '.requirements-sha256'
 $optionalPackages = @('langchain-community==0.3.31', 'wikipedia==1.4.0', 'xmltodict==0.14.2')
 $expectedMarker = "$pythonVersion`:$requirementsHash`:$($optionalPackages -join ';')"
 if (-not (Test-Path -LiteralPath $packageMarker) -or
@@ -184,16 +187,19 @@ function Resolve-DotEnvKey([hashtable]$Values, [string]$Role, [string]$Model, [s
         }
     }
     $uri = $null
-    $isDeepSeek = ($Model -eq 'deepseek-flash') -or
-        ([Uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -and $uri.Host -eq 'api.deepseek.com')
-    if ($isDeepSeek -and $Values.ContainsKey('DEEPSEEK_API_KEY') -and
-        -not [string]::IsNullOrWhiteSpace([string]$Values['DEEPSEEK_API_KEY'])) {
-        return [string]$Values['DEEPSEEK_API_KEY']
+    $isDeepSeek = [Uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -and
+        $uri.Scheme -eq 'https' -and $uri.Host -eq 'api.deepseek.com'
+    if ($isDeepSeek) {
+        foreach ($name in @('DEEPSEEK_API_KEY', 'deepseek_apikey')) {
+            if ($Values.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace([string]$Values[$name])) {
+                return [string]$Values[$name]
+            }
+        }
     }
     if ([Uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$uri) -and $uri.IsLoopback) {
         return 'EMPTY'
     }
-    throw "No .env key configured for $Role at the selected provider. Set ${roleName}_API_KEY; for DeepSeek you may use DEEPSEEK_API_KEY."
+    throw "No .env key configured for $Role at the selected provider. Set ${roleName}_API_KEY; for DeepSeek you may use DEEPSEEK_API_KEY or deepseek_apikey."
 }
 function Read-SelectedKey([string]$Role, [string]$Default, [bool]$HasPatient, [bool]$HasDoctor) {
     $choices = @('1')
@@ -211,6 +217,39 @@ function Resolve-WorkspacePath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { throw 'A file path is required.' }
     if ([IO.Path]::IsPathRooted($Path)) { return [IO.Path]::GetFullPath($Path) }
     return [IO.Path]::GetFullPath((Join-Path $workflowRoot $Path))
+}
+function Assert-NoReparsePoints([string]$Path) {
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'A source or artifact path contains a link or reparse point.'
+        }
+        $next = Split-Path -Parent $current
+        if (-not $next -or $next -eq $current) { break }
+        $current = $next
+    }
+}
+function Assert-OriginalCheckout([string]$Root) {
+    if ($Root.StartsWith('\\') -or -not [IO.Path]::IsPathRooted($Root)) { throw 'Original checkout must be on a local drive.' }
+    $drive = New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($Root))
+    if ($drive.DriveType -notin @([IO.DriveType]::Fixed, [IO.DriveType]::Removable)) { throw 'Original checkout must be on a local drive.' }
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { throw 'Original checkout directory not found.' }
+    Assert-NoReparsePoints $Root
+    $encoding = [Text.Encoding]::GetEncoding(28591)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        foreach ($relative in $originalHashes.Keys) {
+            $path = Join-Path $Root $relative
+            Assert-NoReparsePoints $path
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Original checkout verification failed: missing $relative." }
+            $bytes = [IO.File]::ReadAllBytes($path)
+            $normalized = $encoding.GetBytes($encoding.GetString($bytes).Replace("`r`n", "`n"))
+            $actual = ([BitConverter]::ToString($sha.ComputeHash($normalized))).Replace('-', '').ToLowerInvariant()
+            if ($actual -cne $originalHashes[$relative]) { throw "Original checkout verification failed: hash mismatch for $relative." }
+        }
+    }
+    finally { $sha.Dispose() }
 }
 function Resolve-EvaluationOutput([string]$Path) {
     if ($Path -split '[\\/]' -contains '..') { throw 'Evaluation output cannot contain path traversal.' }
@@ -247,6 +286,9 @@ function Backup-Artifact([string]$Path, [bool]$Move) {
 $runner = @'
 import ast
 import contextlib
+import hashlib
+import importlib.abc
+import importlib.util
 import io
 import json
 import math
@@ -261,7 +303,38 @@ action = cfg['action']
 local_packages = os.environ.get('CP_LOCAL_PACKAGES')
 if local_packages:
     sys.path.insert(0, local_packages)
-sys.path.insert(0, os.path.abspath('codes'))
+original_sources = {}
+if cfg.get('original_hashes'):
+    for path, digest in cfg['original_hashes'].items():
+        with open(path, 'rb') as source:
+            data = source.read()
+        if hashlib.sha256(data.replace(b'\r\n', b'\n')).hexdigest() != digest:
+            raise RuntimeError('Original checkout verification failed')
+        original_sources[path.replace('\\', '/')] = data
+    class OriginalLoader(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+        paths = {'pipeline': 'codes/pipeline.py', **{
+            'utils.' + name: 'codes/utils/' + name + '.py'
+            for name in ('agents', 'mdt', 'run_context', 'tool_manager', 'tools')}}
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == 'utils':
+                return importlib.util.spec_from_loader(fullname, self, is_package=True)
+            if fullname in self.paths:
+                return importlib.util.spec_from_loader(fullname, self)
+            if fullname.startswith('utils.'):
+                raise ModuleNotFoundError('Unverified original module')
+            return None
+        def create_module(self, spec):
+            return None
+        def exec_module(self, module):
+            if module.__name__ == 'utils':
+                module.__path__ = []
+            else:
+                path = self.paths[module.__name__]
+                module.__file__ = os.path.abspath(path)
+                exec(compile(original_sources[path], module.__file__, 'exec'), module.__dict__)
+    sys.meta_path.insert(0, OriginalLoader())
+else:
+    sys.path.insert(0, os.path.abspath('codes'))
 categories = {'AuthenticationError', 'BadRequestError', 'APIConnectionError',
               'APITimeoutError', 'RateLimitError', 'InternalServerError',
               'JSONDecodeError', 'KeyError', 'IndexError', 'TypeError',
@@ -423,8 +496,11 @@ def patch_inference_errors():
 def run_inference_with_paths(result_path, log_path):
     """Set run-specific paths in memory, without modifying inference.py."""
     path = 'codes/inference.py'
-    with open(path, encoding='utf-8-sig') as source:
-        tree = ast.parse(source.read(), filename=path)
+    if original_sources:
+        tree = ast.parse(original_sources[path].decode('utf-8-sig'), filename=path)
+    else:
+        with open(path, encoding='utf-8-sig') as source:
+            tree = ast.parse(source.read(), filename=path)
     args_classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Args']
     if len(args_classes) != 1:
         raise RuntimeError('Inference Args class could not be located')
@@ -446,6 +522,16 @@ def run_inference_with_paths(result_path, log_path):
         raise RuntimeError('Run-specific output or log already exists')
     assignments[0].value = ast.copy_location(ast.Constant(value=result_path), assignments[0].value)
     filenames[0].value = ast.copy_location(ast.Constant(value=log_path), filenames[0].value)
+    if original_sources:
+        # Original directory setup is relative to the checkout; artifacts live elsewhere.
+        def is_artifact_makedirs(node):
+            return (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and
+                    isinstance(node.value.func, ast.Attribute) and node.value.func.attr == 'makedirs' and
+                    isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == 'os' and
+                    node.value.args and isinstance(node.value.args[0], ast.Constant) and
+                    node.value.args[0].value in ('./outputs', './logs'))
+        tree.body = [node for node in tree.body if not is_artifact_makedirs(node)]
+        initializers[0].body = [node for node in initializers[0].body if not is_artifact_makedirs(node)]
     ast.fix_missing_locations(tree)
     namespace = {'__name__': '__main__', '__file__': os.path.abspath(path), '__package__': None}
     exec(compile(tree, path, 'exec'), namespace)
@@ -539,6 +625,10 @@ try:
                         '--max_talk_turns', str(cfg['max_turns']), '--max_query_nums', str(cfg['max_queries'])]
             if cfg['responses']:
                 sys.argv.append('--doctor_responses_api')
+            if not original_sources and cfg.get('baseline', False):
+                sys.argv.append('--baseline')
+            elif not original_sources and cfg.get('use_fhir_memory') is False:
+                sys.argv.append('--no_fhir_memory')
             stage = 'INFERENCE'
             run_inference_with_paths(cfg['result'], cfg['log_path'])
             stage = 'RESULT_VALIDATION'
@@ -567,7 +657,11 @@ try:
                         '--model', cfg['model'], '--base_url', cfg['url'],
                         '--api_key', os.environ['CP_EVALUATOR_KEY'], '--max_workers', str(cfg['max_workers'])]
             stage = 'EVALUATION'
-            runpy.run_path('codes/evaluation.py', run_name='__main__')
+            if original_sources:
+                exec(compile(original_sources['codes/evaluation.py'], os.path.abspath('codes/evaluation.py'), 'exec'),
+                     {'__name__': '__main__', '__file__': os.path.abspath('codes/evaluation.py'), '__package__': None})
+            else:
+                runpy.run_path('codes/evaluation.py', run_name='__main__')
             stage = 'RESULT_VALIDATION'
             results = rows(cfg['output'])
             validate_scores(results, strict=True)
@@ -585,7 +679,11 @@ try:
             validate_scores(results)
             sys.argv = ['codes/evaluation.py', '--output', cfg['output'], '--stats_only',
                         '--api_key', 'offline', '--base_url', 'https://example.invalid']
-            runpy.run_path('codes/evaluation.py', run_name='__main__')
+            if original_sources:
+                exec(compile(original_sources['codes/evaluation.py'], os.path.abspath('codes/evaluation.py'), 'exec'),
+                     {'__name__': '__main__', '__file__': os.path.abspath('codes/evaluation.py'), '__package__': None})
+            else:
+                runpy.run_path('codes/evaluation.py', run_name='__main__')
             if 'Error:' in captured_text():
                 raise RuntimeError('Statistics failed')
             status = True
@@ -624,12 +722,20 @@ sys.exit(0 if status else 1)
 '@
 
 function Invoke-Runner([hashtable]$Config) {
+    if ($sourceChoice -eq '3') {
+        Assert-OriginalCheckout $sourceRoot
+        $Config['original_hashes'] = $originalHashes
+    }
     $env:CP_WORKFLOW_CONFIG = $Config | ConvertTo-Json -Compress -Depth 5
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $output = @($runner | & $pythonCommand @pythonPrefix - 2>&1)
-        $code = $LASTEXITCODE
+        Push-Location -LiteralPath $sourceRoot
+        try {
+            $output = @($runner | & $pythonCommand @pythonPrefix -I -B - 2>&1)
+            $code = $LASTEXITCODE
+        }
+        finally { Pop-Location }
     }
     finally { $ErrorActionPreference = $previousPreference }
     $statuses = @()
@@ -677,7 +783,7 @@ function Invoke-Runner([hashtable]$Config) {
         }
         elseif ($line -ceq 'SAFE_DIAGNOSTIC=CASE_COUNT_EXCEEDS_DATASET') { Write-Host 'The requested case count exceeds the dataset size; no cases were run.' }
         elseif ($line -ceq 'SAFE_DIAGNOSTIC=INCOMPLETE') { Write-Host $line; Write-Host 'The inference record is incomplete; the cause is not established.' }
-        elseif ($line -ceq 'SAFE_RESUMED=YES') { Write-Host 'Existing matching results were reused; current inference settings may not have been applied to those cases.' }
+        elseif ($line -ceq 'SAFE_RESUMED=YES') { Write-Host 'Warning: existing matching results were reused; source, runtime, model, or other current inference settings may not have been applied to those cases. Use a fresh run for a consistent comparison.' }
         elseif ($line -ceq 'SAFE_EVALUATION_API_FAILURES=YES') { Write-Host 'Warning: some evaluation API calls failed; fallback scores may have been used.' }
         elseif ($line -match '^SAFE_STAT=(\[(Clinical Efficacy|Process Competency|Professional Ethics)\]|(WC|DR@3|DR@5|TP|IS|LC|RC|IC|RU|PS|TI|ED|FP)\s*:\s*-?\d+(\.\d+)?|Total Cases Evaluated: \d+)$') { Write-Host $Matches[1] }
     }
@@ -695,6 +801,27 @@ try {
         Write-Host '1 Inference + evaluation | 2 Inference only | 3 Evaluate existing inference | 4 Statistics only | 0 Quit'
         $mode = Read-Choice 'Choose mode' '1' @('0', '1', '2', '3', '4')
         if ($mode -eq '0') { return }
+        Write-Host 'Source: 1=local baseline | 2=local ATR + FHIR (default) | 3=pinned official original | 4=local ATR without FHIR'
+        $sourceChoice = Read-Choice 'Choose source' '2' @('1', '2', '3', '4')
+        $sourceRoot = $workflowRoot
+        $originalHashes = [ordered]@{
+            'codes/inference.py' = '2c08838e7fe51fe4cec6e0eca16e524264f4ae0ec5f4e595aaba00cdcb6ebf81'
+            'codes/evaluation.py' = '2d7b7017d4cccc2664b619b20e70764feb8085012076b8f80afb5dbc2bb888fb'
+            'codes/pipeline.py' = '417799b5a9dceacbb509ac17649f6e3bc01d849da22b52faaf6a757fe4d98e85'
+            'codes/utils/agents.py' = '2f20fa3448ebf8dab1b607b94f0ffb1fb68cc2fcf14c2b10139344713e6780c7'
+            'codes/utils/mdt.py' = '8ece7c0ddacd817e7a5068b6b9e19e22ed508cb889d26d31d3dc1a14953af5a8'
+            'codes/utils/run_context.py' = 'b58ffef55880e19c4ef1e7f3457bca359741e4ddb4e4794b065850c21e81f0dc'
+            'codes/utils/tool_manager.py' = '151a6afe90171d013dad5602e6e1fb536068d8f67d1eea5eb58f52d21a563ec9'
+            'codes/utils/tools.py' = '602b2de9242c37862eb5b661047041778fc5e883b9e3cfd6be9e04ecca10549c'
+            'requirements.txt' = '07e8777590663672e080f646ee5d405751c47c956717eb30a2a72a8fe6c9423b'
+        }
+        if ($sourceChoice -eq '3') {
+            Write-Host 'Supply an existing official checkout at commit 6c33121d96baf610c9c5b15bf3429129555e5acb; no clone or source changes are made.'
+            Write-Host 'Original uses verified original source with launcher runtime selection/output rewrites and DeepSeek thinking disabled; the local baseline and candidate use the changed local runtime. This is not an exact paper reproduction.'
+            $sourceRoot = Resolve-WorkspacePath (Read-Default 'Original checkout directory' '')
+            Assert-OriginalCheckout $sourceRoot
+            Write-Host 'All nine original files verified with SHA256 after CRLF-to-LF normalization.'
+        }
         if ($mode -ne '4' -and -not (Invoke-Runner @{ action = 'verify' })) { throw 'A required workflow file is missing; no workflow started.' }
         if ($mode -in @('1', '2')) {
             Write-Host 'Profiles: 1=Quick DeepSeek test (DeepSeek patient and doctor); 2=Paper-style patient setup (GPT-OSS patient, evaluated doctor).'
@@ -723,10 +850,11 @@ try {
         $credentialMode = $null
         $dotEnvValues = @{}
         if ($mode -in @('1', '2', '3')) {
-            $credentialMode = Read-Choice 'Credentials: 1=load from .env, 2=enter hidden prompts' '2' @('1', '2')
+            $credentialDefault = if (Test-Path -LiteralPath (Join-Path $workflowRoot '.env') -PathType Leaf) { '1' } else { '2' }
+            $credentialMode = Read-Choice 'Credentials: 1=load from .env, 2=enter hidden prompts' $credentialDefault @('1', '2')
             if ($credentialMode -eq '1') {
                 $dotEnvValues = Read-DotEnv
-                Write-Host '.env loaded without displaying values. Use PATIENT_API_KEY, DOCTOR_API_KEY, EVALUATOR_API_KEY, or DEEPSEEK_API_KEY for DeepSeek.'
+                Write-Host '.env loaded without displaying values. DeepSeek accepts DEEPSEEK_API_KEY or deepseek_apikey.'
             }
             else { Write-Host 'API keys are requested with hidden input and are not written to .env.' }
         }
@@ -752,11 +880,25 @@ try {
             $responses = (Read-Choice 'Doctor Responses API? y/n' 'n' @('y', 'n')) -eq 'y'
             $caseCount = Read-Positive 'Number of cases' 1
             $workers = Read-Positive 'Inference parallel workers' 4
+            $baseline = $sourceChoice -eq '1'
+            $useFhirMemory = $sourceChoice -in @('2')
+            if ($baseline) { Write-Host 'Local baseline uses the changed local runtime with --baseline; it is not the pinned original.' }
+            elseif ($sourceChoice -eq '2') { Write-Host 'Local ATR uses additive test-result retrieval, safe report matching, and FHIR R4 shadow event capture.' }
+            elseif ($sourceChoice -eq '4') { Write-Host 'Local ATR-without-FHIR ablation keeps additive retrieval and safe report matching but skips FHIR event capture.' }
+            Write-Host 'Warning: results are exploratory; quality or improvement is not guaranteed. Compare fresh runs with matching settings.'
             $dataRepo = Read-Default 'Dataset repository or path' 'SII-SPIRAL-MED/DiagnosisArena'
             $encounters = Read-Positive 'Maximum encounters' 8
             $turns = Read-Positive 'Maximum talk turns' 5
             $queries = Read-Positive 'Maximum queries' 3
             $runId = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
+            foreach ($directory in @('outputs', 'logs')) {
+                $artifactDirectory = Join-Path $workflowRoot $directory
+                Assert-NoReparsePoints $artifactDirectory
+                if (-not (Test-Path -LiteralPath $artifactDirectory -PathType Container)) {
+                    New-Item -ItemType Directory -Path $artifactDirectory | Out-Null
+                }
+                Assert-NoReparsePoints $artifactDirectory
+            }
             $inputPath = Join-Path $workflowRoot "outputs\P_$patientModel-D_$doctorModel-$runId-results.jsonl"
             $logPath = Join-Path $workflowRoot "logs\mimic_process_$doctorModel-$runId.log"
             Write-Host "Inference output: $inputPath"
@@ -766,7 +908,8 @@ try {
             Write-Host 'Starting inference in new run-specific files; raw Python output is suppressed for safety.'
             $config = @{ action='inference'; result=$inputPath; log_path=$logPath; data_repo=$dataRepo; parallel_workers=$workers; case_count=$caseCount;
                 patient_model=$patientModel; patient_url=$patientUrl; doctor_model=$doctorModel; doctor_url=$doctorUrl;
-                responses=$responses; max_encounters=$encounters; max_turns=$turns; max_queries=$queries }
+                responses=$responses; max_encounters=$encounters; max_turns=$turns; max_queries=$queries;
+                baseline=$baseline; use_fhir_memory=$useFhirMemory }
             if (-not (Invoke-Runner $config)) { throw 'Inference did not complete successfully. Artifacts were retained; evaluation was skipped.' }
             Write-Host 'All selected case results verified successful.'
             if ($mode -eq '2') { return }
@@ -824,6 +967,7 @@ try {
 }
 catch {
     $safeMessages = @('Python virtual environment not found', 'A required workflow file is missing', 'Input cancelled',
+        'Original checkout verification failed:', 'Original checkout directory not found', 'Original checkout must be on a local drive', 'A source or artifact path contains a link',
         'No API key entered', 'Run-specific output or log already exists', 'Cancelled;',
         'Inference did not complete successfully', 'Inference input file not found', 'Inference input is invalid', 'Evaluation file not found',
         'Statistics could not be calculated', 'Evaluation output must differ', 'Evaluation output cannot', 'Evaluation output must be', 'Evaluation output parent directory', 'Evaluation output unexpectedly exists',

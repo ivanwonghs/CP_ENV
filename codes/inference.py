@@ -50,8 +50,18 @@ class Args:
                             help="Maximum conversation turns per consultation. If the limit is exceeded by a specific margin (e.g., 3), the session is forcibly paused.")
         parser.add_argument('--max_query_nums', type=int, default=3, 
                             help="Maximum number of queries allowed per dialogue interaction.")
+        parser.add_argument('--baseline', action='store_true', help="Disable ATR, FHIR event capture, and safe report matching.")
+        parser.add_argument('--no_fhir_memory', action='store_true', help="Run ATR and safe report matching without FHIR event capture.")
         
         self.pargs = parser.parse_args()
+        self.pargs.use_fhir_memory = not self.pargs.baseline and not self.pargs.no_fhir_memory
+        if self.pargs.use_fhir_memory:
+            try:
+                from importlib.metadata import PackageNotFoundError, version
+                if version('fhirclient') != '4.2.0':
+                    parser.error('FHIR memory requires fhirclient==4.2.0 (FHIR R4)')
+            except (ImportError, PackageNotFoundError):
+                parser.error('FHIR memory requires fhirclient==4.2.0 (FHIR R4)')
         
         # Map parsed arguments to class attributes
         for key, value in vars(self.pargs).items():
@@ -61,7 +71,8 @@ class Args:
         self.parseargs()
         # Define the output file path based on model names
         os.makedirs("./outputs", exist_ok=True)
-        self.output_path = f"./outputs/P_{self.patient_model_name}-D_{self.doctor_model_name}-results.jsonl"
+        suffix = "-baseline" if self.baseline else "-atr-no-fhir" if self.no_fhir_memory else "-atr"
+        self.output_path = f"./outputs/P_{self.patient_model_name}-D_{self.doctor_model_name}{suffix}-results.jsonl"
 
 # Initialize global arguments
 args = Args()  
